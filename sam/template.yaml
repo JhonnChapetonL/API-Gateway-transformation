@@ -1,0 +1,186 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Serverless Framework for DNC
+
+Globals:
+  Function:
+    Timeout: 30
+    MemorySize: 256
+    Runtime: dotnet6
+    Architectures:
+      - x86_64
+    VpcConfig:
+      SecurityGroupIds:
+        - !Ref LambdaSecurityGroup
+      SubnetIds: !Ref Subnets
+    Tags:
+      Environment: !Ref Env
+      Department: Platform
+      Owner: DNC
+  Api:
+    OpenApiVersion: 3.0.3
+
+Parameters:
+  Env:
+    Type: String
+    Default: "dev"
+    Description: Environment
+  Vpc:
+    Type: String
+    Default: "vpc-*"
+    Description: Vpc
+  Subnets:
+    Type: CommaDelimitedList
+    Default: "*"
+    Description: Subnets
+  Version:
+    Type: String
+    Default: latest
+    Description: Application version (Octopus release number)
+  CorsUri:
+    Type: String
+    Default: "*"
+    Description: Cors Uri
+
+Mappings: 
+  EnvVariables:
+    AccountId:
+      dev: "*"
+
+Resources:
+  DncLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole'
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaSQSQueueExecutionRole'
+        - !Sub 
+          - 'arn:aws:iam::${AWSAccountId}:policy/dnc-policy'
+          - AWSAccountId: !FindInMap [EnvVariables, AccountId, !Ref Env]
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - 'lambda.amazonaws.com'
+            Action:
+              - 'sts:AssumeRole'
+
+  DncExternalApiGatewayRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Path: /
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs'
+
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Lambda security group
+      VpcId: !Ref Vpc
+
+  DncExternalApiGateway:
+    Type: AWS::Serverless::Api
+    DependsOn: DncExternalApiGatewayAccount
+    Properties:
+      StageName: Prod
+      Cors:
+        AllowMethods: "'GET,POST,PUT,DELETE'"
+        AllowHeaders: "'Content-Type,source-key'"
+        AllowOrigin: !Sub "'${CorsUri}'"
+      DefinitionBody:
+        Fn::Transform:
+          Name: AWS::Include
+          Parameters:
+            Location: open_external_api.yaml
+      AccessLogSetting:
+        DestinationArn: !GetAtt DncExternalApiGatewayLog.Arn
+        Format: '{"requestId":"$context.requestId", "ip":"$context.identity.sourceIp", "caller":"$context.identity.caller", "user":"$context.identity.user", "requestTime":"$context.requestTime", "httpMethod":"$context.httpMethod", "resourcePath":"$context.resourcePath", "status":"$context.status", "protocol":"$context.protocol", "responseLength":"$context.responseLength", "errorMessage":"$context.error.message", "traceId":"$context.xrayTraceId"}'
+      TracingEnabled: true
+      Auth:
+        ApiKeyRequired: true
+
+  DncExternalApiGatewayLog:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/api-external-gateway/${AWS::StackName}-DncExternalApiGateway"
+      RetentionInDays: 30
+
+  DncExternalApiGatewayAccount:
+    Type: AWS::ApiGateway::Account
+    Properties: 
+      CloudWatchRoleArn: !GetAtt DncExternalApiGatewayRole.Arn
+
+  PostTargetDncListFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: DNC.Functions.TargetDncListAPI::DNC.Functions.TargetDncListAPI.PostTargetDncListFunction::FunctionHandler
+      CodeUri: ../src/DNC.Functions.TargetDncListAPI/
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds: !Ref Subnets
+      MemorySize: 1792
+      Environment:
+        Variables:
+          APP_VERSION: !Ref Version
+          CORS_URI: !Ref CorsUri
+      Role: !GetAtt DncLambdaRole.Arn
+      Events:
+        PrudentialEmails:
+          Type: Api
+          Properties:
+            Path: /api/prudential-emails
+            Method: post
+            RestApiId: !Ref DncExternalApiGateway
+            Auth:
+              ApiKeyRequired: true
+      LoggingConfig:
+        LogGroup: !Ref PostTargetDncListFunctionLogGroup
+
+  PostTargetDncListFunctionLogGroup:
+      Type: AWS::Logs::LogGroup
+      Properties:
+        LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-PostTargetDncListFunction"
+        RetentionInDays: 180
+
+  DncApiUsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    Properties: 
+      ApiStages: 
+        - ApiId: !Ref DncExternalApiGateway
+          Stage: !Ref DncExternalApiGateway.Stage
+      UsagePlanName: DncApiTestUsagePlan
+
+  DncApiKey:
+    Type: AWS::ApiGateway::ApiKey
+    Properties:
+      Enabled: true
+      Name: dnc_api_test_key
+      Description: "CloudFormation API Key V1"
+      Value: b8c1f4aa-f25d-4ad0-b2a5-a69dca1669d6
+      StageKeys:
+        - RestApiId: !Ref DncExternalApiGateway
+          StageName: !Ref DncExternalApiGateway.Stage
+
+  DncApiUsagePlanKey:
+    Type: "AWS::ApiGateway::UsagePlanKey"
+    Properties:
+      KeyId: !Ref DncApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref DncApiUsagePlan
+
+Outputs:
+  ContactPreferencesExternalApi:
+    Description: "API Gateway endpoint URL for Prod stage for DNC External api"
+    Value: !Sub "https://${DncExternalApiGateway}.execute-api.${AWS::Region}.amazonaws.com/Prod/"
